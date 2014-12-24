@@ -1,0 +1,246 @@
+/*
+Usage:
+./gradlew task_name
+(or gradlew.bat task_name if you have the misfortune to have to use Windows)
+If no task name is specified then the default task 'assemble' is run
+Task names are:
+idea - generate a skeleton IntelliJ IDEA project
+eclipse - generate a skeleton Eclipse IDE project
+assemble - builds the outputs, by default this is the module zip file. It can also include a jar file if produceJar
+in gradle.properties is set to true. Outputs are created in build/libs.
+if pullInDeps in gradle.properties is set to 'true' then the modules dependencies will be
+automatically pulled into a nested mods directory inside the module during the build
+copyMod - builds and copies the module to the local 'mods' directory so you can execute vertx runmod (etc)
+directly from the command line
+modZip - creates the module zip into build/libs
+clean - cleans everything up
+test - runs the tests. An nice html test report is created in build/reports/tests (index.html)
+runMod - runs the module. This is similar to executing vertx runmod from the command line except that it does
+not use the version of Vert.x installed and on the PATH to run it. Instead it uses the version of Vert.x
+that the module was compiled and tested against.
+pullInDeps - pulls in all dependencies of the module into a nested module directory
+uploadArchives - upload the module zip file (and jar if one has been created) to Nexus. You will need to
+configure sonatypeUsername and sonatypePassword in ~/.gradle/gradle.properties.
+install - install any jars produced to the local Maven repository (.m2)
+*/
+
+
+/*
+Module structure
+  module-name
+    |-lib
+    |  |- dependency1.jar
+    |
+    |- mod.json
+    |
+    \- mypackage
+        |- myclass1.class
+        \- myclass2.class
+ */
+
+
+import org.vertx.java.platform.impl.cli.Starter
+
+/*
+ * Copyright 2012 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+apply plugin: 'java'
+apply plugin: 'groovy'
+apply plugin: 'idea'
+apply plugin: 'eclipse'
+
+def cpSeparator = System.getProperty("path.separator")
+
+// We  have to explicitly load props from the user home dir - on CI we set
+// GRADLE_USER_HOME to a different dir to avoid problems with concurrent builds corrupting
+// a shared Maven local and using Gradle wrapper concurrently
+loadProperties("${System.getProperty('user.home')}/.gradle/gradle.properties")
+
+group = modowner
+archivesBaseName = modname
+
+defaultTasks = ['assemble']
+
+sourceCompatibility = '1.7'
+targetCompatibility = '1.7'
+
+project.ext.moduleName = "$modowner~$modname~$version"
+
+configurations {
+  provided
+  testCompile.extendsFrom provided
+}
+
+repositories {
+  maven { url 'https://oss.sonatype.org/content/repositories/snapshots' }
+  mavenCentral()
+}
+
+dependencies {
+  provided "org.codehaus.groovy:groovy-all:$groovyVersion"
+  provided "io.vertx:lang-groovy:$groovyLangModVersion@jar"
+  provided "io.vertx:vertx-core:$vertxVersion"
+  provided "io.vertx:vertx-platform:$vertxVersion"
+  testCompile "junit:junit:$junitVersion"
+  testCompile "io.vertx:testtools:$toolsVersion"
+}
+
+// This sets up the classpath for the script itself
+buildscript {
+
+  repositories {
+    maven { url 'https://oss.sonatype.org/content/repositories/snapshots' }
+    mavenCentral()
+  }
+
+  dependencies {
+    classpath "io.vertx:vertx-core:$vertxVersion"
+    classpath "io.vertx:vertx-platform:$vertxVersion"
+    classpath "io.vertx:vertx-hazelcast:$vertxVersion"
+
+    // Extra classpath for Vert.x
+
+    // Users can be Vert.x platform classpath files (e.g. langs.properties) in either src/main/platform_lib
+    // or src/main/resources/platform_lib (if they want it in the module for fatjars)
+    classpath files(['src/main/platform_lib'])
+    classpath fileTree(dir: 'src/main/platform_lib', includes: ['*.jar', '*.zip'])
+    classpath files(['src/main/resources/platform_lib'])
+    classpath fileTree(dir: 'src/main/resources/platform_lib', includes: ['*.jar', '*.zip'])
+  }
+}
+
+sourceSets {
+  main {
+    compileClasspath = compileClasspath + configurations.provided
+  }
+}
+
+task copyMod( type:Copy, dependsOn: 'classes', description: 'Assemble the module into the local mods directory' ) {
+  into "build/mods/$moduleName"
+  from compileGroovy
+  from 'src/main/resources'
+  into ('build/lib') {
+    from configurations.provided
+  }
+}
+
+task modZip( type: Zip, dependsOn: 'pullInDeps', description: 'Package the module .zip file') {
+  group = 'vert.x'
+  classifier = "mod"
+  description = "Assembles a vert.x module"
+  destinationDir = project.file('build/libs')
+  archiveName = "${modname}-${version}" + ".zip"
+  from copyMod
+}
+
+artifacts {
+  archives modZip
+}
+
+
+test {
+  dependsOn copyMod
+
+  // Make sure tests are always run!
+  outputs.upToDateWhen { false }
+
+  // Show output
+  testLogging.showStandardStreams = true
+
+  testLogging { exceptionFormat "full" }
+
+  systemProperty 'vertx.mods', "build/mods"
+}
+
+task init(description: 'Create module link and CP file') << {
+  setSysProps()
+  doInit()
+}
+
+task collectDeps(type: Copy) {
+  destinationDir = file("build")
+  into("deps") {
+    from configurations.provided
+  }
+}
+
+task runMod(description: 'Run the module', dependsOn: collectDeps) << {
+  setSysProps()
+  // We also init here - this means for single module builds the user doesn't have to explicitly init -
+  // they can just do runMod
+  doInit()
+  def runModArgs = ['runmod', moduleName]
+  Starter.main(runModArgs as String[])
+}
+
+def doInit() {
+  File cpFile = new File("vertx_classpath.txt")
+  if (!cpFile.exists()) {
+    cpFile.createNewFile();
+    String defaultCp = "build/deps\r\n";
+    cpFile << defaultCp;
+  }
+  def args = ['create-module-link', moduleName, '-cp', 'build/deps']
+  Starter.main(args as String[])
+}
+
+task pullInDeps(dependsOn: copyMod, description: 'Pull in all the module dependencies for the module into the nested mods directory') << {
+  if (pullInDeps == 'true') {
+    setSysProps()
+    def args = ['pulldeps', moduleName]
+    Starter.main(args as String[])
+  }
+}
+
+task fatJar(dependsOn: modZip, description: 'Creates a fat executable jar which contains everything needed to run the module') << {
+  if (createFatJar == 'true') {
+    setSysProps()
+    def args = ['fatjar', moduleName, '-d', 'build/libs']
+    Starter.main(args as String[])
+  }
+}
+
+def setSysProps() {
+  System.setProperty("vertx.clusterManagerFactory", "org.vertx.java.spi.cluster.impl.hazelcast.HazelcastClusterManagerFactory")
+  String modsDir = System.getenv("VERTX_MODS")
+  if (modsDir == null) {
+    modsDir = "build/mods";
+  }
+  System.setProperty("vertx.mods", modsDir)
+}
+
+def loadProperties(String sourceFileName) {
+  def config = new Properties()
+  def propFile = new File(sourceFileName)
+  if (propFile.canRead()) {
+    config.load(new FileInputStream(propFile))
+    for (Map.Entry property in config) {
+      project.ext[property.key] = property.value;
+    }
+  }
+}
+
+//// Map the 'provided' dependency configuration to the appropriate IDEA visibility scopes.
+//plugins.withType(IdeaPlugin) {
+//  idea {
+//    module {
+//      scopes.PROVIDED.plus += configurations.provided
+//      scopes.COMPILE.minus += configurations.provided
+//      scopes.TEST.minus += configurations.provided
+//      scopes.RUNTIME.minus += configurations.provided
+//    }
+//  }
+//}
